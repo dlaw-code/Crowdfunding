@@ -1,0 +1,1 @@
+8726a5557a23cd1e8bb05a8f9dc6a9368da4be2987aa15fa8f48862957c281fe  crowdfunded.wasm
