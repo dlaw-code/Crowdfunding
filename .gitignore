@@ -14,3 +14,7 @@
 # IDEs
 *.iml
 .idea
+
+
+# Deployment artifacts
+deployed_contracts.json

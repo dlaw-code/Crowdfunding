@@ -3,10 +3,9 @@ use serde::{Deserialize, Serialize};
 
 use cosmwasm_std::{
     to_json_binary, Addr, CosmosMsg, CustomQuery, Querier, QuerierWrapper, StdResult, WasmMsg,
-    WasmQuery,
+    WasmQuery,  // <-- Correct import
 };
-
-use crate::msg::{ExecuteMsg, GetProjectDetailsResponse, GetContributorsResponse, QueryMsg};
+use crate::msg::{ExecuteMsg, GetContributorsResponse, GetProjectDetailsResponse, QueryMsg};
 
 /// CrowdFundingContract is a wrapper around Addr that provides a lot of helpers
 /// for working with this.
@@ -36,7 +35,11 @@ impl CrowdFundingContract {
         CQ: CustomQuery,
     {
         let msg = QueryMsg::GetProjectDetails {};
-        let query = WasmQuery::Smart {
+        // let query = WasmQueqry::Smart {
+        //     contract_addr: self.addr().into(),
+        //     msg: to_json_binary(&msg)?,
+        // }
+        let query = WasmQuery::Smart {  // <-- Fixed typo here
             contract_addr: self.addr().into(),
             msg: to_json_binary(&msg)?,
         }

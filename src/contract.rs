@@ -1,14 +1,17 @@
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
-use cosmwasm_std::{to_json_binary, Binary, Deps, DepsMut, Env, MessageInfo, Response, StdResult};
+use cosmwasm_std::{
+    to_json_binary, Binary, Deps, DepsMut, Env, MessageInfo, Response,
+    StdResult, StdError, Uint128
+};
 use cw2::set_contract_version;
-use cosmwasm_std::Timestamp;
 
 use crate::error::ContractError;
-use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg, GetProjectDetailsResponse, GetContributorsResponse};
-use crate::state::{State, STATE, CONTRIBUTORS};
+use crate::msg::{
+    ExecuteMsg, GetContributorsResponse, GetProjectDetailsResponse, InstantiateMsg, QueryMsg,
+};
+use crate::state::{State, CONTRIBUTORS, STATE};
 
-// version info for migration info
 const CONTRACT_NAME: &str = "crates.io:crowdfunding";
 const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -19,13 +22,11 @@ pub fn instantiate(
     info: MessageInfo,
     msg: InstantiateMsg,
 ) -> Result<Response, ContractError> {
-    // Clone `msg.name` before moving it into the `State` struct
-    let name = msg.name.clone();
     let state = State {
-        name: name, // Use the cloned value
+        name: msg.name.clone(),
         description: msg.description,
         funding_goal: msg.funding_goal,
-        current_funding: 0,
+        current_funding: Uint128::zero(), // Explicitly initialize to zero
         deadline: msg.deadline,
         owner: info.sender.clone(),
     };
@@ -33,13 +34,11 @@ pub fn instantiate(
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
     STATE.save(deps.storage, &state)?;
 
-    // Now you can still use `msg.name` here
     Ok(Response::new()
         .add_attribute("method", "instantiate")
         .add_attribute("owner", info.sender)
         .add_attribute("project_name", msg.name))
 }
-
 
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn execute(
@@ -52,88 +51,128 @@ pub fn execute(
         ExecuteMsg::Contribute {} => execute::contribute(deps, env, info),
         ExecuteMsg::Withdraw { amount } => execute::withdraw(deps, env, info, amount),
         ExecuteMsg::Refund {} => execute::refund(deps, env, info),
+        ExecuteMsg::ExtendDeadline { new_deadline } => execute::extend_deadline(deps, env, info, new_deadline),
     }
 }
-
 pub mod execute {
     use super::*;
 
-    // Inside the `execute::contribute` function
-pub fn contribute(deps: DepsMut, env: Env, info: MessageInfo) -> Result<Response, ContractError> {
-    // First, update the state
-    STATE.update(deps.storage, |mut state| -> Result<_, ContractError> {
-        if env.block.time > Timestamp::from_nanos(state.deadline) {
-            return Err(ContractError::DeadlineExceeded {});
+    pub fn contribute(
+        deps: DepsMut,
+        env: Env,
+        info: MessageInfo,
+    ) -> Result<Response, ContractError> {
+        // Explicitly validate and extract the contribution
+        let contribution = match info.funds.as_slice() {
+            [coin] if coin.denom == "earth" => coin.amount,
+            _ => return Err(ContractError::InvalidFunds {}),
+        };
+
+        // Validate positive contribution
+        if contribution.is_zero() {
+            return Err(ContractError::EmptyContribution {});
         }
 
-        let contribution = info.funds.iter()
-            .find(|coin| coin.denom == "earth")
-            .map(|coin| coin.amount.u128())
-            .unwrap_or(0);
+        // Update project funding - ONLY ADDITION
+        STATE.update(deps.storage, |mut state| -> Result<_, ContractError> {
+            // Check deadline
+            if env.block.time.seconds() > state.deadline {
+                return Err(ContractError::DeadlineExceeded {});
+            }
 
-        state.current_funding += contribution;
-        Ok(state)
-    })?;
+            // Handle the Result from checked_add properly
+            state.current_funding = state.current_funding.checked_add(contribution)
+                .map_err(|_| ContractError::Overflow {})?;
+            Ok(state)
+        })?;
 
-    // Then, update the contributors
-    CONTRIBUTORS.update(deps.storage, &info.sender, |amount| -> StdResult<_> {
-        let contribution = info.funds.iter()
-            .find(|coin| coin.denom == "earth")
-            .map(|coin| coin.amount.u128())
-            .unwrap_or(0);
+        // Update contributor balance - ONLY ADDITION
+        CONTRIBUTORS.update(deps.storage, &info.sender, |balance| {
+            let current = balance.unwrap_or(Uint128::zero());
+            current.checked_add(contribution)
+                .map_err(|e| StdError::overflow(e))
+        })?;
 
-        Ok(amount.unwrap_or_default() + contribution)
-    })?;
+        Ok(Response::new()
+            .add_attribute("action", "contribute")
+            .add_attribute("sender", info.sender)
+            .add_attribute("amount", contribution))
+    }
+    pub fn withdraw(
+        deps: DepsMut,
+        env: Env,
+        info: MessageInfo,
+        amount: Uint128,
+    ) -> Result<Response, ContractError> {
+        STATE.update(deps.storage, |mut state| -> Result<_, ContractError> {
+            if info.sender != state.owner {
+                return Err(ContractError::Unauthorized {});
+            }
 
-    Ok(Response::new().add_attribute("action", "contribute"))
-}
+            if env.block.time.seconds() < state.deadline 
+                || state.current_funding < state.funding_goal
+            {
+                return Err(ContractError::WithdrawalNotAllowed {});
+            }
 
+            state.current_funding = state.current_funding.checked_sub(amount)
+                .map_err(|_| ContractError::Overflow {})?;
+            Ok(state)
+        })?;
 
-// Inside the `execute::withdraw` function
-pub fn withdraw(deps: DepsMut, env: Env, info: MessageInfo, amount: u128) -> Result<Response, ContractError> {
-    STATE.update(deps.storage, |mut state| -> Result<_, ContractError> {
+        Ok(Response::new().add_attribute("action", "withdraw"))
+    }
+
+    pub fn refund(
+        deps: DepsMut,
+        env: Env,
+        info: MessageInfo,
+    ) -> Result<Response, ContractError> {
+        STATE.update(deps.storage, |state| -> Result<_, ContractError> {
+            if env.block.time.seconds() < state.deadline {
+                return Err(ContractError::RefundNotAllowed {});
+            }
+
+            if state.current_funding >= state.funding_goal {
+                return Err(ContractError::RefundNotAllowed {});
+            }
+
+            Ok(state)
+        })?;
+
+        let amount = CONTRIBUTORS.load(deps.storage, &info.sender)?;
+        STATE.update(deps.storage, |mut state| -> Result<_, ContractError> {
+            state.current_funding = state.current_funding.checked_sub(amount)
+                .map_err(|_| ContractError::Overflow {})?;
+            Ok(state)
+        })?;
+
+        Ok(Response::new().add_attribute("action", "refund"))
+    }
+
+    pub fn extend_deadline(
+        deps: DepsMut,
+        env: Env,
+        info: MessageInfo,
+        new_deadline: u64,
+    ) -> Result<Response, ContractError> {
+        let mut state = STATE.load(deps.storage)?;
+        
         if info.sender != state.owner {
             return Err(ContractError::Unauthorized {});
         }
-
-        if env.block.time < Timestamp::from_nanos(state.deadline) || state.current_funding < state.funding_goal {
-            return Err(ContractError::WithdrawalNotAllowed {});
+        
+        if new_deadline <= env.block.time.seconds() {
+            return Err(ContractError::InvalidDeadline {});
         }
-
-        state.current_funding -= amount;
-        Ok(state)
-    })?;
-
-    Ok(Response::new().add_attribute("action", "withdraw"))
-}
-
-
-
-    // Inside the `execute::refund` function
-pub fn refund(deps: DepsMut, env: Env, info: MessageInfo) -> Result<Response, ContractError> {
-    // First, check and update the state
-    STATE.update(deps.storage, |state| -> Result<_, ContractError> {
-    if env.block.time < Timestamp::from_nanos(state.deadline) {
-        return Err(ContractError::RefundNotAllowed {});
+        
+        state.deadline = new_deadline;
+        STATE.save(deps.storage, &state)?;
+        
+        Ok(Response::new()
+            .add_attribute("action", "extend_deadline")
+            .add_attribute("new_deadline", new_deadline.to_string()))
     }
-
-    if state.current_funding >= state.funding_goal {
-        return Err(ContractError::RefundNotAllowed {});
-    }
-
-    Ok(state)
-})?;
-
-    // Then, load the contributor's amount and update the state again
-    let amount = CONTRIBUTORS.load(deps.storage, &info.sender)?;
-    STATE.update(deps.storage, |mut state| -> Result<_, ContractError> {
-        state.current_funding -= amount;
-        Ok(state)
-    })?;
-
-    Ok(Response::new().add_attribute("action", "refund"))
-}
-
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
